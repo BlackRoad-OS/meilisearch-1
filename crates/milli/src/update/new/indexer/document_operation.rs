@@ -1,5 +1,5 @@
 use std::sync::atomic::Ordering;
-use std::{mem, ops, ptr, vec};
+use std::{ops, ptr, vec};
 
 use bstr::ByteSlice;
 use bumpalo::collections::vec::Vec as BumpVec;
@@ -9,7 +9,9 @@ use heed::RoTxn;
 use indexmap::map::Entry;
 use indexmap::IndexMap;
 use memmap2::Mmap;
-use rayon::iter::{IndexedParallelIterator, IntoParallelIterator, ParallelIterator};
+use rayon::iter::{
+    IndexedParallelIterator, IntoParallelIterator, IntoParallelRefMutIterator, ParallelIterator,
+};
 use rayon::slice::{ParallelSlice, ParallelSliceMut as _};
 use rustc_hash::FxBuildHasher;
 use serde_json::value::RawValue;
@@ -28,6 +30,8 @@ use crate::update::new::thread_local::MostlySend;
 use crate::update::new::{DocumentIdentifiers, Insertion, Update};
 use crate::update::{AvailableIds, IndexDocumentsMethod, MissingDocumentPolicy};
 use crate::{DocumentId, Error, FieldsIdsMap, Index, InternalError, Result, UserError};
+
+pub type PayloadId = u32;
 
 /// The set of operations to be applied to multiple documents in an index.
 #[derive(Default)]
@@ -110,7 +114,7 @@ impl<'pl> IndexOperations<'pl> {
             Ok(pk) => (pk, Vec::new(), operations),
             Err(_user_error) => {
                 let (primary_key, pre_payload_stats, operations) =
-                    fetch_primary_and_ignore_payloads(
+                    fetch_primary_key_and_ignore_payloads(
                         indexer,
                         index,
                         rtxn,
@@ -136,34 +140,76 @@ impl<'pl> IndexOperations<'pl> {
         let (step, progress_step) = AtomicPayloadStep::new(payload_count);
         progress.update_progress(progress_step);
 
-        let IndexedPayloadOperations { document_operations, fields_ids_map, payload_stats } =
+        let IndexedPayloadOperations { document_operations, fields_ids_map, mut payload_stats } =
             remaining_operations
                 .into_par_iter()
                 .enumerate()
-                .map(|(payload_index, payload)| {
+                .map(|(payload_id, payload)| {
                     if must_stop_processing() {
                         return Err(InternalError::AbortedIndexation.into());
                     }
-                    step.store(payload_index as u32, Ordering::Relaxed);
-                    IndexedPayloadOperations::from_payload(payload, &primary_key, shards)
+                    step.fetch_add(1, Ordering::Relaxed);
+
+                    let payload_id = payload_id.try_into().unwrap();
+                    IndexedPayloadOperations::from_payload(
+                        payload,
+                        payload_id,
+                        &primary_key,
+                        shards,
+                    )
                 })
                 .try_reduce(IndexedPayloadOperations::default, |lhs, rhs| lhs | rhs)?;
 
         step.store(payload_count, Ordering::Relaxed);
 
-        // We must drain the HashMap into a Vec because rayon::hash_map::IntoIter: !Clone
-        progress.update_progress(IndexingStep::AssigningDocumentsIds);
+        // TODO add a step
+        let thread_local_rtxns = ThreadLocal::new();
         let external_documents_ids = index.external_documents_ids();
+        payload_stats.par_iter_mut().enumerate().for_each(|(payload_id, payload_stats)| {
+            let payload_id: PayloadId = payload_id.try_into().unwrap();
+            payload_stats.document_count = document_operations
+                .iter()
+                .map(|(external_id, ops)| {
+                    let mut maybe_skipped = false;
+                    for (pid, op) in ops.0.iter().rev().skip_while(|(pid, _)| *pid != payload_id) {
+                        match op {
+                            DocumentOperation::Replacement { on_missing_document, .. }
+                            | DocumentOperation::Update { on_missing_document, .. } => {
+                                match on_missing_document {
+                                    MissingDocumentPolicy::Create => return 1,
+                                    MissingDocumentPolicy::Skip => {
+                                        maybe_skipped = *pid == payload_id;
+                                        continue;
+                                    }
+                                }
+                            }
+                            DocumentOperation::Deletion => return (*pid == payload_id) as u64,
+                        }
+                    }
+
+                    if maybe_skipped {
+                        let local_rtxn =
+                            thread_local_rtxns.get_or_try(|| index.read_txn()).unwrap();
+                        if external_documents_ids.get(local_rtxn, external_id).unwrap().is_some() {
+                            return 1;
+                        }
+                    }
+
+                    return 0;
+                })
+                .sum::<u64>();
+        });
+
+        progress.update_progress(IndexingStep::AssigningDocumentsIds);
 
         // We read the database in parallel to retrieve the internal IDs of the existing
         // documents and mark the ones that need a new ID. To avoid creating a lot of
         // read transactions we prefer store the read transactions in a thread-local variable.
-        let thread_local_rtxns = ThreadLocal::new();
         let extracted_docids = document_operations
             .par_keys()
-            .enumerate()
-            .map(|(_, external_id)| {
+            .map(|external_id| {
                 let local_rtxn = thread_local_rtxns.get_or_try(|| index.read_txn())?;
+                // TODO do not collect too many Result<Option<u32>> and rather Option<u32>
                 external_documents_ids.get(local_rtxn, external_id)
             })
             .collect_vec_list();
@@ -173,6 +219,7 @@ impl<'pl> IndexOperations<'pl> {
         let number_of_operations = document_operations.len();
         let mut docids_version_offsets = BumpVec::with_capacity_in(number_of_operations, indexer);
 
+        // We must drain the HashMap into a Vec because rayon::hash_map::IntoIter: !Clone
         let docids = extracted_docids.into_iter().flatten();
         for ((external_id, ops), docid_result) in document_operations.into_iter().zip(docids) {
             let (docid, is_missing) = match docid_result? {
@@ -213,7 +260,7 @@ impl<'pl> IndexOperations<'pl> {
 
 /// Fetches the primary key from the operations and removes the ignored ones.
 /// Collecting the stats and the useful payloads for future use.
-fn fetch_primary_and_ignore_payloads<'pl>(
+fn fetch_primary_key_and_ignore_payloads<'pl>(
     bump: &'pl Bump,
     index: &Index,
     rtxn: &'pl RoTxn<'pl>,
@@ -302,6 +349,7 @@ struct IndexedPayloadOperations<'pl> {
 impl<'pl> IndexedPayloadOperations<'pl> {
     fn from_payload(
         payload_operation: Payload<'pl>,
+        payload_id: PayloadId,
         primary_key: &PrimaryKey<'_>,
         shards: Option<&Shards>,
     ) -> Result<Self> {
@@ -310,6 +358,7 @@ impl<'pl> IndexedPayloadOperations<'pl> {
         let (document_operations, payload_stats, fields_ids_map) = match payload_operation {
             Payload::Replace { payload, on_missing_document } => extract_payload_changes(
                 payload,
+                payload_id,
                 on_missing_document,
                 primary_key,
                 ReplaceDocuments,
@@ -317,13 +366,15 @@ impl<'pl> IndexedPayloadOperations<'pl> {
             )?,
             Payload::Update { payload, on_missing_document } => extract_payload_changes(
                 payload,
+                payload_id,
                 on_missing_document,
                 primary_key,
                 UpdateDocuments,
                 shards,
             )?,
             Payload::Deletion(docids) => {
-                let (document_operations, stats) = extract_payload_deletions(docids, shards);
+                let (document_operations, stats) =
+                    extract_payload_deletions(docids, payload_id, shards);
                 (document_operations, stats, FieldsIdsMap::default())
             }
         };
@@ -355,16 +406,7 @@ impl ops::BitOr for IndexedPayloadOperations<'_> {
         for (external_document_id, rhs_docops) in rhs_document_operations {
             match document_operations.entry(external_document_id) {
                 Entry::Occupied(mut entry) => {
-                    // Unfortunately we don't have the OccupiedEntry::replace_entry_with method
-                    // on the IndexMap entry. This operation would be much more elegant otherwise.
-                    let lhs_docops = mem::replace(entry.get_mut(), DocumentOperations::empty());
-                    match DocumentOperations::from_iter(
-                        lhs_docops.into_iter().chain(rhs_docops),
-                        DocumentExistence::Unknown,
-                    ) {
-                        Some(operations) => entry.insert(operations),
-                        None => entry.shift_remove(),
-                    };
+                    entry.get_mut().extend(rhs_docops);
                 }
                 Entry::Vacant(vacant_entry) => {
                     vacant_entry.insert(rhs_docops);
@@ -383,23 +425,17 @@ impl ops::BitOr for IndexedPayloadOperations<'_> {
 }
 
 /// A set of operations applied to a single document in a particular order.
-struct DocumentOperations<'pl>(Vec<DocumentOperation<'pl>>);
+#[derive(Debug)]
+struct DocumentOperations<'pl>(Vec<(PayloadId, DocumentOperation<'pl>)>);
 
 impl<'pl> DocumentOperations<'pl> {
-    /// Creates an empty set of operations.
-    ///
-    /// This is useful mostly when merging documents operations retrieved
-    /// from payload and shouldn't be considered a valid state otherwise.
-    fn empty() -> Self {
-        DocumentOperations(Vec::new())
-    }
-
-    fn one_deletion() -> Self {
-        DocumentOperations(vec![DocumentOperation::Deletion])
+    fn one_deletion(payload_id: PayloadId) -> Self {
+        DocumentOperations(vec![(payload_id, DocumentOperation::Deletion)])
     }
 
     fn from_raw_value(
         method: IndexDocumentsMethod,
+        payload_id: PayloadId,
         document: &'pl RawValue,
         on_missing_document: MissingDocumentPolicy,
     ) -> Self {
@@ -411,19 +447,19 @@ impl<'pl> DocumentOperations<'pl> {
             UpdateDocuments => Update { document, on_missing_document },
         };
 
-        DocumentOperations(vec![operation])
+        DocumentOperations(vec![(payload_id, operation)])
     }
 
     fn from_iter<I>(operations: I, document_existence: DocumentExistence) -> Option<Self>
     where
-        I: IntoIterator<Item = DocumentOperation<'pl>>,
+        I: IntoIterator<Item = (PayloadId, DocumentOperation<'pl>)>,
     {
         use DocumentOperation::*;
         use MissingDocumentPolicy::*;
 
         let mut document_operations = Vec::new();
-        for operation in operations {
-            let existence_after_last_op = match document_operations.last() {
+        for (pid, operation) in operations {
+            let existence_after_last_op = match document_operations.last().map(|(_, op)| op) {
                 Some(Replacement { .. } | Update { .. }) => DocumentExistence::Exists,
                 Some(Deletion) => DocumentExistence::Missing,
                 None => document_existence,
@@ -441,15 +477,15 @@ impl<'pl> DocumentOperations<'pl> {
                 // deletions and replacements delete all previous operations
                 (_, op @ (Deletion | Replacement { .. })) => {
                     document_operations.clear();
-                    document_operations.push(op);
+                    document_operations.push((pid, op));
                 }
                 // updates executes after the previous operations
-                (_, op @ Update { .. }) => document_operations.push(op),
+                (_, op @ Update { .. }) => document_operations.push((pid, op)),
             }
         }
 
         match (document_existence, document_operations.last()) {
-            (DocumentExistence::Missing, Some(Deletion) | None) => None,
+            (DocumentExistence::Missing, Some((_, Deletion)) | None) => None,
             (_, _) => Some(DocumentOperations(document_operations)),
         }
     }
@@ -469,7 +505,7 @@ impl<'pl> DocumentOperations<'pl> {
                 is_new: was_missing, // same thing
                 operations: operations
                     .into_iter()
-                    .map(|op| match op {
+                    .map(|(_, op)| match op {
                         Replacement { document, .. } => {
                             InnerDocOp::Replace(DocumentOffset { content: document })
                         }
@@ -486,6 +522,7 @@ impl<'pl> DocumentOperations<'pl> {
     fn push_raw_value(
         &mut self,
         method: IndexDocumentsMethod,
+        payload_id: PayloadId,
         raw_value: &'pl RawValue,
         on_missing_document: MissingDocumentPolicy,
     ) {
@@ -497,12 +534,12 @@ impl<'pl> DocumentOperations<'pl> {
             UpdateDocuments => Update { document: raw_value, on_missing_document },
         };
 
-        self.0.push(operation);
+        self.0.push((payload_id, operation));
     }
 }
 
 impl<'pl> IntoIterator for DocumentOperations<'pl> {
-    type Item = DocumentOperation<'pl>;
+    type Item = (PayloadId, DocumentOperation<'pl>);
     type IntoIter = vec::IntoIter<Self::Item>;
 
     fn into_iter(self) -> Self::IntoIter {
@@ -510,14 +547,21 @@ impl<'pl> IntoIterator for DocumentOperations<'pl> {
     }
 }
 
+impl<'pl> Extend<(PayloadId, DocumentOperation<'pl>)> for DocumentOperations<'pl> {
+    /// Note that extending the operations doesn't reduce them.
+    fn extend<T: IntoIterator<Item = (PayloadId, DocumentOperation<'pl>)>>(&mut self, iter: T) {
+        self.0.extend(iter);
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 enum DocumentExistence {
-    Unknown,
     Exists,
     Missing,
 }
 
 /// Represents an operation to be performed on a document.
+#[derive(Debug)]
 enum DocumentOperation<'pl> {
     Replacement { document: &'pl RawValue, on_missing_document: MissingDocumentPolicy },
     Update { document: &'pl RawValue, on_missing_document: MissingDocumentPolicy },
@@ -526,6 +570,7 @@ enum DocumentOperation<'pl> {
 
 fn extract_payload_changes<'pl>(
     payload: &'pl [u8],
+    payload_id: PayloadId,
     on_missing_document: MissingDocumentPolicy,
     primary_key: &PrimaryKey<'_>,
     method: IndexDocumentsMethod,
@@ -559,11 +604,17 @@ fn extract_payload_changes<'pl>(
 
         match new_docids_version_offsets.entry(external_document_id.to_owned()) {
             Entry::Occupied(mut occupied_entry) => {
-                occupied_entry.get_mut().push_raw_value(method, doc, on_missing_document);
+                occupied_entry.get_mut().push_raw_value(
+                    method,
+                    payload_id,
+                    doc,
+                    on_missing_document,
+                );
             }
             Entry::Vacant(vacant_entry) => {
                 vacant_entry.insert(DocumentOperations::from_raw_value(
                     method,
+                    payload_id,
                     doc,
                     on_missing_document,
                 ));
@@ -573,7 +624,8 @@ fn extract_payload_changes<'pl>(
 
     let payload_stats = PayloadStats {
         bytes: payload.len() as u64,
-        document_count: new_docids_version_offsets.len() as u64,
+        // We compute the number of documents actually indexed later.
+        document_count: 0,
         error: None,
     };
 
@@ -582,12 +634,13 @@ fn extract_payload_changes<'pl>(
 
 fn extract_payload_deletions<'pl>(
     external_document_ids: &[&str],
+    payload_id: PayloadId,
     shards: Option<&Shards>,
 ) -> (IndexMap<String, DocumentOperations<'pl>>, PayloadStats) {
     let docops: IndexMap<_, _> = external_document_ids
         .iter()
         .filter(|id| shards.is_none_or(|shards| shards.must_process(id)))
-        .map(|id| (id.to_string(), DocumentOperations::one_deletion()))
+        .map(|id| (id.to_string(), DocumentOperations::one_deletion(payload_id)))
         .collect();
     let payload_stats = PayloadStats { bytes: 0, document_count: docops.len() as u64, error: None };
     (docops, payload_stats)
