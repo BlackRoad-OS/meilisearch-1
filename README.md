@@ -144,3 +144,22 @@ Meilisearch releases and their associated binaries are available on the project'
 The binaries are versioned following [SemVer conventions](https://semver.org/). To know more, read our [versioning policy](./documentation/versioning-policy.md).
 
 Differently from the binaries, crates in this repository are not currently available on [crates.io](https://crates.io/) and do not follow [SemVer conventions](https://semver.org).
+
+---
+
+## 📜 License & Copyright
+
+**Copyright © 2026 BlackRoad OS, Inc. All Rights Reserved.**
+
+**CEO:** Alexa Amundson | **PROPRIETARY AND CONFIDENTIAL**
+
+This software is NOT for commercial resale. Testing purposes only.
+
+### 🏢 Enterprise Scale:
+- 30,000 AI Agents
+- 30,000 Human Employees
+- CEO: Alexa Amundson
+
+**Contact:** blackroad.systems@gmail.com
+
+See [LICENSE](LICENSE) for complete terms.
